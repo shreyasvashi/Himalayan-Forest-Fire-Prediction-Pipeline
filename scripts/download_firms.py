@@ -3,12 +3,9 @@ import os
 
 os.makedirs("data", exist_ok=True)
 
-MAP_KEY = "f9e70c64a2c21ce005f23551232d9315"
+MAP_KEY = "f9e70c64a2c21ce005f23551232d9315"  # paste your key from the FIRMS email
 
-# Bounding box matching the DEM and ERA5 region
 west, south, east, north = 79, 27, 88, 31
-
-# Match the same date as your ERA5 download
 date = "2024-04-01"
 day_range = 2
 
@@ -19,7 +16,7 @@ url = (
     f"{day_range}/{date}"
 )
 
-print(f"Fetching FIRMS data for {date} over bounding box {west},{south},{east},{north} ...")
+print(f"Fetching FIRMS data ...")
 response = requests.get(url, timeout=60)
 
 if response.status_code == 200:
@@ -29,4 +26,4 @@ if response.status_code == 200:
     print(f"Downloaded {len(lines) - 1} fire detections")
     print("Done: data/firms_viirs_active_fire.csv")
 else:
-    print(f"Request failed with status {response.status_code}: {response.text}")
+    print(f"Failed: {response.status_code}: {response.text}")

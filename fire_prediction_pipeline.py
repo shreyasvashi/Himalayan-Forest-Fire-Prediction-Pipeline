@@ -522,38 +522,33 @@ class FireSpreadSimulator:
         starting_hour_index: int = 0,
         random_seed: int = 7,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Runs the simulation forward in time.
-        Returns the final state grid and a cumulative probability grid representing
-        the maximum hourly ignition probability observed at each cell across all hours.
-        """
         random_generator = np.random.default_rng(random_seed)
         current_state = initial_state.copy()
-
+        target_shape = initial_state.shape
         cumulative_probability_grid = np.zeros_like(initial_state, dtype="float32")
 
         for hour_offset in range(hours_to_simulate):
             hour_index = starting_hour_index + hour_offset
-
             meteorology = meteorology_loader.get_hourly_wind_and_moisture(hour_index)
 
+            wind_speed = self._resample_to_shape(meteorology["wind_speed_ms"], target_shape)
+            wind_direction = self._resample_to_shape(meteorology["wind_direction_deg"], target_shape)
+            fuel_moisture = self._resample_to_shape(meteorology["fuel_moisture_coefficient"], target_shape)
+
             current_state, ignition_probability_grid = self.cellular_automata.step(
-                current_state,
-                meteorology["wind_speed_ms"],
-                meteorology["wind_direction_deg"],
-                meteorology["fuel_moisture_coefficient"],
-                random_generator,
+                current_state, wind_speed, wind_direction, fuel_moisture, random_generator,
             )
-
             cumulative_probability_grid = np.maximum(cumulative_probability_grid, ignition_probability_grid)
-
-            log.info(
-                "Hour %d simulated, currently burning cells: %d",
-                hour_index,
-                int(np.sum(current_state == STATE_BURNING)),
-            )
+            log.info("Hour %d simulated, burning cells: %d", hour_index, int(np.sum(current_state == STATE_BURNING)))
 
         return current_state, cumulative_probability_grid
+
+    def _resample_to_shape(self, source_array: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        if source_array.shape == target_shape:
+            return source_array.astype("float32")
+        row_indices = np.linspace(0, source_array.shape[0] - 1, target_shape[0]).astype("int64")
+        col_indices = np.linspace(0, source_array.shape[1] - 1, target_shape[1]).astype("int64")
+        return source_array[np.ix_(row_indices, col_indices)].astype("float32")
 
 
 # ----------------------------------------------------------------------
@@ -766,21 +761,132 @@ class HimalayanFirePredictionPipeline:
 
 def main() -> None:
     config = PipelineConfig(
-        dem_path="data/srtm_himalaya_30m.tif",
+        dem_path="data/srtm_himalaya_250m.tif",
         era5_path="data/era5_land_hourly.nc",
         firms_csv_path="data/firms_viirs_active_fire.csv",
         output_dir="output",
-        block_size=512,
+        block_size=256,
+        cell_size_m=240.0,
         hours_to_simulate=24,
-        mcmc_walkers=32,
-        mcmc_steps=1500,
-        mcmc_burn_in=300,
+        mcmc_walkers=8,
+        mcmc_steps=200,
+        mcmc_burn_in=50,
     )
 
     pipeline = HimalayanFirePredictionPipeline(config)
-    result = pipeline.run()
-    log.info("Final result: %s", json.dumps(result, indent=2))
 
+    # Compute slope and aspect
+    topography_loader = TopographyLoader(config)
+    slope_path = f"{config.output_dir}/slope.tif"
+    aspect_path = f"{config.output_dir}/aspect.tif"
+    topography_loader.compute_slope_aspect(slope_path, aspect_path)
+
+    with rasterio.open(slope_path) as slope_dataset:
+        slope_grid = slope_dataset.read(1)
+        raster_transform = slope_dataset.transform
+
+    with rasterio.open(aspect_path) as aspect_dataset:
+        aspect_grid = aspect_dataset.read(1)
+
+    log.info("Grid size: %d x %d pixels", slope_grid.shape[0], slope_grid.shape[1])
+
+    # Seed synthetic fire points in the center of the grid since FIRMS has no NRT data
+    # for historical dates. In production replace this with real FIRMS detections.
+    initial_state = np.zeros(slope_grid.shape, dtype="uint8")
+    center_row = slope_grid.shape[0] // 2
+    center_col = slope_grid.shape[1] // 2
+    seed_radius = 3
+    initial_state[
+        center_row - seed_radius: center_row + seed_radius,
+        center_col - seed_radius: center_col + seed_radius,
+    ] = STATE_BURNING
+    log.info("Seeded %d burning cells", int(np.sum(initial_state == STATE_BURNING)))
+
+    # Load meteorology
+    meteorology_loader = MeteorologyLoader(config)
+
+    # Use a small subgrid for MCMC calibration to keep memory low
+    calibration_size = 200
+    row_start = center_row - calibration_size // 2
+    col_start = center_col - calibration_size // 2
+    row_end = row_start + calibration_size
+    col_end = col_start + calibration_size
+
+    slope_subgrid = slope_grid[row_start:row_end, col_start:col_end]
+    aspect_subgrid = aspect_grid[row_start:row_end, col_start:col_end]
+    initial_state_subgrid = initial_state[row_start:row_end, col_start:col_end]
+
+    calibration_hours = 6
+    wind_speed_series = np.zeros((calibration_hours, calibration_size, calibration_size), dtype="float32")
+    wind_direction_series = np.zeros((calibration_hours, calibration_size, calibration_size), dtype="float32")
+    fuel_moisture_series = np.zeros((calibration_hours, calibration_size, calibration_size), dtype="float32")
+
+    for hour_index in range(calibration_hours):
+        meteorology = meteorology_loader.get_hourly_wind_and_moisture(hour_index)
+        wind_speed_series[hour_index] = pipeline._resample_to_shape(
+            meteorology["wind_speed_ms"], (calibration_size, calibration_size)
+        )
+        wind_direction_series[hour_index] = pipeline._resample_to_shape(
+            meteorology["wind_direction_deg"], (calibration_size, calibration_size)
+        )
+        fuel_moisture_series[hour_index] = pipeline._resample_to_shape(
+            meteorology["fuel_moisture_coefficient"], (calibration_size, calibration_size)
+        )
+
+    observed_final_state_subgrid = initial_state_subgrid.copy()
+    observed_final_state_subgrid[initial_state_subgrid == STATE_BURNING] = STATE_BURNED_OUT
+
+    calibration_dataset = CalibrationDataset(
+        slope_grid=slope_subgrid,
+        aspect_grid=aspect_subgrid,
+        wind_speed_series=wind_speed_series,
+        wind_direction_series=wind_direction_series,
+        fuel_moisture_series=fuel_moisture_series,
+        initial_state=initial_state_subgrid,
+        observed_final_state=observed_final_state_subgrid,
+    )
+
+    calibrator = MCMCCalibrator(config, calibration_dataset)
+    calibrated_parameters = calibrator.run_calibration()
+
+    # Run full simulation on the complete downsampled grid
+    simulator = FireSpreadSimulator(slope_grid, aspect_grid, calibrated_parameters)
+    final_state_grid, cumulative_probability_grid = simulator.run_simulation(
+        initial_state, meteorology_loader, config.hours_to_simulate
+    )
+
+    threat_map_generator = ThreatMapGenerator(config)
+    threat_grid = threat_map_generator.classify_threat_levels(
+        cumulative_probability_grid, final_state_grid
+    )
+
+    output_threat_path = f"{config.output_dir}/threat_map.tif"
+    output_probability_path = f"{config.output_dir}/probability_map.tif"
+    threat_map_generator.write_threat_map(
+        threat_grid, cumulative_probability_grid, slope_path,
+        output_threat_path, output_probability_path
+    )
+
+    evacuation_summary = threat_map_generator.generate_evacuation_summary(
+        threat_grid, raster_transform
+    )
+
+    result = {
+        "calibrated_parameters": calibrated_parameters,
+        "evacuation_summary": evacuation_summary,
+        "threat_map_path": output_threat_path,
+        "probability_map_path": output_probability_path,
+    }
+
+    summary_path = f"{config.output_dir}/run_summary.json"
+    with open(summary_path, "w") as summary_file:
+        json.dump(result, summary_file, indent=2)
+
+    log.info("Pipeline complete. Summary: %s", json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
